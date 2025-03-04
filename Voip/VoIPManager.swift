@@ -1,14 +1,12 @@
 import Foundation
 import AVFoundation
-import PJSIP
+import linphonesw
 
 class VoIPManager: ObservableObject {
-    private var endpoint: pjsua_t?
-    private var account: pjsua_acc_id?
-    private var currentCall: pjsua_call_id?
-    private var sipConfig = pjsua_config()
-    private var mediaConfig = pjsua_media_config()
-    private var transportId: pjsua_transport_id?
+    private var core: Core?
+    private var account: Account?
+    private var currentCall: Call?
+    private let factory = Factory.Instance()
     
     // SIP账户配置 - 请替换为您的实际SIP服务器信息
     private let sipDomain = "sip.example.com"    // 替换为您的SIP服务器域名
@@ -23,74 +21,44 @@ class VoIPManager: ObservableObject {
     
     init() {
         setupAudioSession()
-        initializePJSIP()
+        initializeLinphone()
     }
     
-    private func initializePJSIP() {
-        var status = pjsua_create()
-        guard status == PJ_SUCCESS else {
-            print("Error creating PJSUA")
-            return
+    private func initializeLinphone() {
+        do {
+            try factory.start()
+            core = try factory.createCore(configPath: "", factoryConfigPath: "", systemContext: nil)
+            try core?.start()
+            
+            // 配置SIP传输
+            let transports = try factory.createTransports()
+            transports.udpPort = 5060
+            try core?.setTransports(transports)
+            
+            registerAccount()
+        } catch {
+            print("Error initializing Linphone: \(error)")
         }
-        
-        // 配置PJSUA
-        pjsua_config_default(&sipConfig)
-        pjsua_media_config_default(&mediaConfig)
-        
-        // 初始化PJSUA
-        status = pjsua_init(&sipConfig, &mediaConfig, nil)
-        guard status == PJ_SUCCESS else {
-            print("Error initializing PJSUA")
-            return
-        }
-        
-        // 创建SIP传输
-        var transportConfig = pjsua_transport_config()
-        pjsua_transport_config_default(&transportConfig)
-        transportConfig.port = 5060
-        
-        status = pjsua_transport_create(PJSIP_TRANSPORT_UDP, &transportConfig, &transportId)
-        guard status == PJ_SUCCESS else {
-            print("Error creating transport")
-            return
-        }
-        
-        // 启动PJSUA
-        status = pjsua_start()
-        guard status == PJ_SUCCESS else {
-            print("Error starting PJSUA")
-            return
-        }
-        
-        registerAccount()
     }
     
     private func registerAccount() {
-        var accountConfig = pjsua_acc_config()
-        pjsua_acc_config_default(&accountConfig)
-        
-        let idUri = "sip:\(username)@\(sipDomain)"
-        let regUri = "sip:\(sipDomain)"
-        
-        accountConfig.id = pj_str(idUri)
-        accountConfig.reg_uri = pj_str(regUri)
-        accountConfig.cred_count = 1
-        accountConfig.cred_info.0.realm = pj_str("*")
-        accountConfig.cred_info.0.scheme = pj_str("digest")
-        accountConfig.cred_info.0.username = pj_str(username)
-        accountConfig.cred_info.0.data_type = PJSIP_CRED_DATA_PLAIN_PASSWD
-        accountConfig.cred_info.0.data = pj_str(password)
-        
-        var accId: pjsua_acc_id = -1
-        let status = pjsua_acc_add(&accountConfig, PJ_TRUE, &accId)
-        
-        if status == PJ_SUCCESS {
-            self.account = accId
-            DispatchQueue.main.async {
-                self.isRegistered = true
+        do {
+            let authInfo = try factory.createAuthInfo(username: username, userid: username, passwd: password, ha1: "", realm: "*", domain: sipDomain)
+            try core?.addAuthInfo(authInfo)
+            
+            let accountParams = try core?.createAccountParams()
+            try accountParams?.setIdentityAddress(try factory.createAddress(addr: "sip:\(username)@\(sipDomain)"))
+            try accountParams?.setServerAddress(try factory.createAddress(addr: "sip:\(sipDomain)"))
+            try accountParams?.setRegisterEnabled(true)
+            
+            account = try core?.createAccount(params: accountParams!)
+            try account?.addListener { [weak self] account, state, message in
+                DispatchQueue.main.async {
+                    self?.isRegistered = state == .Ok
+                }
             }
-        } else {
-            print("Error registering account")
+        } catch {
+            print("Error registering account: \(error)")
         }
     }
     
@@ -107,38 +75,42 @@ class VoIPManager: ObservableObject {
     func startCall(to recipient: String) {
         guard !isInCall, isRegistered else { return }
         
-        let destUri = "sip:\(recipient)@\(sipDomain)"
-        var callId: pjsua_call_id = -1
-        
-        let status = pjsua_call_make_call(account!, pj_str(destUri), 0, nil, nil, &callId)
-        
-        if status == PJ_SUCCESS {
-            currentCall = callId
-            isInCall = true
-            startCallTimer()
-        } else {
-            print("Error making call")
+        do {
+            let address = try factory.createAddress(addr: "sip:\(recipient)@\(sipDomain)")
+            currentCall = try core?.inviteAddress(addr: address)
+            try currentCall?.addListener { [weak self] call, state, message in
+                if state == .Connected {
+                    DispatchQueue.main.async {
+                        self?.isInCall = true
+                        self?.startCallTimer()
+                    }
+                }
+            }
+        } catch {
+            print("Error making call: \(error)")
         }
     }
     
     func endCall() {
-        guard isInCall, let callId = currentCall else { return }
+        guard isInCall, let call = currentCall else { return }
         
-        let status = pjsua_call_hangup(callId, 200, nil, nil)
-        if status == PJ_SUCCESS {
+        do {
+            try call.terminate()
             currentCall = nil
             isInCall = false
             stopCallTimer()
-        } else {
-            print("Error hanging up call")
+        } catch {
+            print("Error hanging up call: \(error)")
         }
     }
     
     deinit {
-        if let callId = currentCall {
-            pjsua_call_hangup(callId, 200, nil, nil)
+        if let call = currentCall {
+            try? call.terminate()
         }
-        pjsua_destroy()
+        core?.stop()
+        core = nil
+        try? factory.stop()
     }
     
     private func startCallTimer() {

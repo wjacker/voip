@@ -6,6 +6,7 @@
 //
 
 import SwiftUI
+import linphonesw
 
 @main
 struct VoipApp: App {

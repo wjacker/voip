@@ -6,6 +6,7 @@
 //
 
 import SwiftUI
+import linphonesw
 
 struct ContentView: View {
     @StateObject private var voipManager = VoIPManager()
